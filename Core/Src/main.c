@@ -18,7 +18,6 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "memorymap.h"
 #include "spi.h"
 #include "tim.h"
 #include "usart.h"
@@ -43,6 +42,14 @@
 /* USER CODE BEGIN PD */
 #define DEG2RAD 0.017453292519943295f // Pi / 180
 #define RAD2DEG 57.29577951308232f    // 180 / Pi
+
+/* ====== EDIT IF NEEDED ====== */
+#define SPI_HANDLE   hspi2                 // SPI instance wired to IMU
+#define CS_PORT      LSM_NCS_GPIO_Port     // IMU chip-select port
+#define CS_PIN       LSM_NCS_Pin           // IMU chip-select pin
+/* ============================ */
+#define REG_WHO_AM_I 0x0F
+#define SPI_READ_BIT 0x80
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -110,50 +117,6 @@ int32_t platform_read(void *handle, uint8_t reg, uint8_t *bufp, uint16_t len)
     return 0;
 }
 
-/*
-===============
-SERVO FUNCTIONS
-===============
-*/
-void Servo_SetAngle(TIM_HandleTypeDef *htim, uint32_t Channel, float angle)
-{
-    // angle range: -90 to +90 degrees
-    float pulse_length_ms = ((angle + 90.0f) / 180.0f) * 1.0f + 1.0f; // maps [-90,+90] to [1ms,2ms]
-
-    // Convert pulse length in ms to timer counts (0.2us resolution)
-    uint32_t pulse_counts = (uint32_t)(pulse_length_ms * 5000.0f);
-
-    __HAL_TIM_SET_COMPARE(htim, Channel, pulse_counts);
-}
-
-void Servo_Sweep_Demo(TIM_HandleTypeDef *htim, uint32_t Channel)
-{
-    const int delay_ms = 10;  // Adjust this for speed of sweep
-    float angle;
-
-    // 0° to -90°
-    for (angle = 0; angle >= -90; angle -= 1.0f) {
-        Servo_SetAngle(htim, Channel, angle);
-        HAL_Delay(delay_ms);
-    }
-
-    HAL_Delay(500);
-
-    // -90° to +90°
-    for (angle = -90; angle <= 90; angle += 1.0f) {
-        Servo_SetAngle(htim, Channel, angle);
-        HAL_Delay(delay_ms);
-    }
-
-    HAL_Delay(500);
-
-    // +90° back to 0°
-    for (angle = 90; angle >= 0; angle -= 1.0f) {
-        Servo_SetAngle(htim, Channel, angle);
-        HAL_Delay(delay_ms);
-    }
-}
-
 // To redirect the printf to output to the UART instead so I can see it in putty
 int __io_putchar(int ch)
 {
@@ -161,30 +124,6 @@ int __io_putchar(int ch)
     return ch;
 }
 
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
-{
-  if (htim->Instance == TIM3) {
-      fusion_tick = 1;              // 500 Hz “call Madgwick now”
-  }
-}
-
-static void IMU_CalibrateGyro(stmdev_ctx_t *ctx, float bias_out_dps[3]) {
-    // Assumes the board is held still for ~0.5 s
-    const int N = 200;
-    int32_t sx = 0, sy = 0, sz = 0;
-    int16_t g[3];
-    for (int i = 0; i < N; i++) {
-        lsm6dsv16x_angular_rate_raw_get(ctx, g);
-        sx += g[0]; sy += g[1]; sz += g[2];
-        HAL_Delay(2); // ~500 ms total
-    }
-    float gx = (float)(sx / N);
-    float gy = (float)(sy / N);
-    float gz = (float)(sz / N);
-    bias_out_dps[0] = lsm6dsv16x_from_fs500_to_mdps((int16_t)gx) / 1000.0f;
-    bias_out_dps[1] = lsm6dsv16x_from_fs500_to_mdps((int16_t)gy) / 1000.0f;
-    bias_out_dps[2] = lsm6dsv16x_from_fs500_to_mdps((int16_t)gz) / 1000.0f;
-}
 /* USER CODE END 0 */
 
 /**
@@ -223,61 +162,25 @@ int main(void)
   MX_TIM2_Init();
   MX_TIM3_Init();
   MX_UART5_Init();
+  MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
+
+
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
   HAL_TIM_Base_Start_IT(&htim3);      // start periodic update IRQ
+
+  // Contains the value read from the specified register
+  uint8_t whoami = 0;
+
+  int correct = 0;
+  int incorrect = 0;
 
   // Setup lsm6dsv16x_ctx correctly for thios device setup
   lsm6dsv16x_ctx.handle = &hspi2;
   lsm6dsv16x_ctx.mdelay = HAL_Delay;
   lsm6dsv16x_ctx.write_reg = platform_write;
   lsm6dsv16x_ctx.read_reg = platform_read;
-
-  // Perform self tests on the accelerometer and gyroscope
-  lsm6dsv16x_xl_self_test_set(&lsm6dsv16x_ctx, LSM6DSV16X_XL_ST_POSITIVE);
-  lsm6dsv16x_gy_self_test_set(&lsm6dsv16x_ctx, LSM6DSV16X_GY_ST_POSITIVE);
-  HAL_Delay(500); // Wait for the self test to complete
-  lsm6dsv16x_xl_self_test_set(&lsm6dsv16x_ctx, LSM6DSV16X_XL_ST_DISABLE);
-  lsm6dsv16x_gy_self_test_set(&lsm6dsv16x_ctx, LSM6DSV16X_GY_ST_DISABLE);
-
-  /*----------Device Reset-----------*/
-  lsm6dsv16x_sh_reset_set(&lsm6dsv16x_ctx, PROPERTY_ENABLE);
-  uint8_t rst;
-  do {
-    lsm6dsv16x_sh_reset_get(&lsm6dsv16x_ctx, &rst);
-  } while (rst);
-
-  // Match Madgwick rate to IMU ODR (you set 104 Hz)
-  sampleFreq = 104.0f;
-
-  // Quick gyro bias while stationary
-  IMU_CalibrateGyro(&lsm6dsv16x_ctx, gyro_bias_dps);
-
-
-  /*---------------Run Time Settings--------------*/
-  lsm6dsv16x_block_data_update_set(&lsm6dsv16x_ctx, PROPERTY_ENABLE);
-
-  // Enable high performance mode (API uses "mode" naming)
-  lsm6dsv16x_xl_mode_set(&lsm6dsv16x_ctx, LSM6DSV16X_XL_HIGH_PERFORMANCE_MD);
-  lsm6dsv16x_gy_mode_set(&lsm6dsv16x_ctx, LSM6DSV16X_GY_HIGH_PERFORMANCE_MD);
-
-  lsm6dsv16x_xl_data_rate_set(&lsm6dsv16x_ctx, LSM6DSV16X_ODR_AT_120Hz);
-  lsm6dsv16x_gy_data_rate_set(&lsm6dsv16x_ctx, LSM6DSV16X_ODR_AT_120Hz);
-  lsm6dsv16x_xl_full_scale_set(&lsm6dsv16x_ctx, LSM6DSV16X_8g);
-  lsm6dsv16x_gy_full_scale_set(&lsm6dsv16x_ctx, LSM6DSV16X_500dps);
-
-  // Enable Low Pass Filter 1/2 on the accelerometer and gyroscope
-  // (driver function names use the 'filt_' prefix)
-  lsm6dsv16x_filt_xl_lp2_set(&lsm6dsv16x_ctx, PROPERTY_ENABLE);
-  lsm6dsv16x_filt_gy_lp1_set(&lsm6dsv16x_ctx, PROPERTY_ENABLE);
-  /*
-   * The previous code used a function named
-   *   lsm6dsv16x_gy_hp_path_internal_set(..., LSM6DSV16X_HP_FILTER_16mHz)
-   * which does not exist in the provided lsm6dsv16x driver API. If a
-   * gyro high-pass internal path is required, pick the appropriate
-   * API from lsm6dsv16x_reg.h (for example filt_xl_hp_set is available
-   * for the accelerometer). For now this call is omitted.
-   */
+  
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -285,42 +188,22 @@ int main(void)
   while (1)
   {
 
-    // Servo_Sweep_Demo(&htim2, TIM_CHANNEL_2);
+    lsm6dsv16x_device_id_get(&lsm6dsv16x_ctx, &whoami);
 
-    lsm6dsv16x_flag_data_ready_get(&lsm6dsv16x_ctx, &drdy);
-
-    if (drdy.drdy_xl && drdy.drdy_gy) {
-      // If both accelerometer and gyroscope data are ready, retrieve the data
-      lsm6dsv16x_acceleration_raw_get(&lsm6dsv16x_ctx, (int16_t*)accel_raw);
-      lsm6dsv16x_angular_rate_raw_get(&lsm6dsv16x_ctx, (int16_t*)gyro_raw);
-
-      accel_g[0] = (lsm6dsv16x_from_fs8_to_mg(accel_raw[0])) / 1000.0f;
-      accel_g[1] = (lsm6dsv16x_from_fs8_to_mg(accel_raw[1])) / 1000.0f;
-      accel_g[2] = (lsm6dsv16x_from_fs8_to_mg(accel_raw[2])) / 1000.0f;
-
-      gyro_dps[0] = (lsm6dsv16x_from_fs500_to_mdps(gyro_raw[0])) / 1000.0f;
-      gyro_dps[1] = (lsm6dsv16x_from_fs500_to_mdps(gyro_raw[1])) / 1000.0f;
-      gyro_dps[2] = (lsm6dsv16x_from_fs500_to_mdps(gyro_raw[2])) / 1000.0f;
-
-      // Normalize accel in-place (required by Madgwick)
-      float inv = 1.0f / sqrtf(accel_g[0]*accel_g[0] + accel_g[1]*accel_g[1] + accel_g[2]*accel_g[2]);
-      accel_g[0] *= inv;  accel_g[1] *= inv;  accel_g[2] *= inv;
-
-      // Run fusion (IMU variant: gyro in rad/s, accel in g, normalized)
-      MadgwickAHRSupdateIMU(gyro_dps[0]*DEG2RAD, gyro_dps[1]*DEG2RAD, gyro_dps[2]*DEG2RAD,
-                            accel_g[0],         accel_g[1],         accel_g[2]);
-
-      // Stream quaternion + sensors (CSV line that your Python can parse)
-      printf("IMU,%lu,%.6f,%.6f,%.6f,%.6f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f\r\n",
-              (unsigned long)HAL_GetTick(), q0, q1, q2, q3,
-              gyro_dps[0], gyro_dps[1], gyro_dps[2],
-              accel_g[0],  accel_g[1],  accel_g[2]);
-
+    if (whoami == LSM6DSV16X_WHO_AM_I){
+      correct ++;
+      printf("Success! Who am I register value: 0x%x\r\n", whoami);
+    } else {
+      incorrect ++;
+      printf("Error! Who am I register value: 0x%x\r\n", whoami);
     }
+
+  }
+
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-  }
+
   /* USER CODE END 3 */
 }
 
@@ -374,7 +257,7 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.AHBCLKDivider = RCC_HCLK_DIV1;
   RCC_ClkInitStruct.APB3CLKDivider = RCC_APB3_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_APB1_DIV2;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_APB2_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_APB2_DIV2;
   RCC_ClkInitStruct.APB4CLKDivider = RCC_APB4_DIV1;
 
   if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK)
@@ -430,8 +313,7 @@ void Error_Handler(void)
   }
   /* USER CODE END Error_Handler_Debug */
 }
-
-#ifdef  USE_FULL_ASSERT
+#ifdef USE_FULL_ASSERT
 /**
   * @brief  Reports the name of the source file and the source line number
   *         where the assert_param error has occurred.

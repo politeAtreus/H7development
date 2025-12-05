@@ -73,10 +73,6 @@ void Error_Handler(void);
 #define SPI_MISO_GPIO_Port GPIOB
 #define SPI_MOSI_Pin GPIO_PIN_15
 #define SPI_MOSI_GPIO_Port GPIOB
-#define UART1_RX_Pin GPIO_PIN_5
-#define UART1_RX_GPIO_Port GPIOB
-#define UART1_TX_Pin GPIO_PIN_6
-#define UART1_TX_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 
